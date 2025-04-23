@@ -547,12 +547,33 @@ class VideoViewer(QMainWindow):
 def get_cache_file_path():
     """
     Get the path to the file storing the last used folder.
-    File will be stored in the same directory as the script for easy access.
+    Handles both development and PyInstaller frozen environments.
     
     Returns:
         str: Absolute path to the cache file
     """
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_folder.txt')
+    if getattr(sys, 'frozen', False):
+        # If the application is run as a bundle (compiled with PyInstaller)
+        application_path = os.path.dirname(sys.executable)
+    else:
+        # If the application is run from a Python interpreter
+        application_path = os.path.dirname(os.path.abspath(__file__))
+        
+    cache_file = os.path.join(application_path, 'last_folder.txt')
+    
+    # Ensure the directory exists and is writable
+    try:
+        # Try to create a test file to verify write permissions
+        test_file = os.path.join(application_path, 'test_write')
+        with open(test_file, 'w') as f:
+            f.write('test')
+        os.remove(test_file)
+        return cache_file
+    except (IOError, OSError):
+        # If we can't write to the application directory, use the user's documents folder
+        documents_path = os.path.expanduser('~/Documents/TikTokViewer')
+        os.makedirs(documents_path, exist_ok=True)
+        return os.path.join(documents_path, 'last_folder.txt')
 
 def save_folder_to_cache(folder_path):
     """
