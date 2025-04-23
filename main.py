@@ -263,6 +263,7 @@ class VideoViewer(QMainWindow):
             
         The window size is calculated to:
         - Maintain aspect ratio
+        - Be at least half the screen height
         - Not exceed 90% of screen height
         - Include padding for controls
         - Preserve window position after first placement
@@ -284,11 +285,12 @@ class VideoViewer(QMainWindow):
             
         # Calculate target size maintaining aspect ratio
         screen = QApplication.primaryScreen().geometry()
+        min_height = int(screen.height() * 0.5)  # 50% of screen height
         max_height = int(screen.height() * 0.9)  # 90% of screen height
         
-        # Calculate new dimensions
+        # Calculate new dimensions, ensuring minimum height
         aspect_ratio = video_width / video_height
-        target_height = min(max_height, video_height)
+        target_height = max(min_height, min(max_height, video_height))
         target_width = int(target_height * aspect_ratio)
         
         # Set new size with some padding
@@ -305,7 +307,7 @@ class VideoViewer(QMainWindow):
             # Otherwise maintain the current position
             self.resize(new_width, new_height)
             self.move(current_pos)
-        
+
     def center_window(self):
         """
         Center the window on the primary screen.
