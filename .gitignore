@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+last_folder.txt
+
+
 # C extensions
 *.so
 

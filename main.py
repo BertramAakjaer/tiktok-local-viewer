@@ -1,43 +1,91 @@
+#!/usr/bin/env python3
+"""
+TikTok-style Local Video Viewer
+------------------------------
+A standalone application that provides a TikTok-like interface for viewing local video files.
+Features:
+- Frameless window with custom drag functionality
+- Video playback using VLC backend
+- Vertical scrolling navigation
+- Smart video preloading
+- Window size adaptation based on video dimensions
+- Last folder memory
+
+Dependencies:
+- PyQt5: For the GUI framework
+- python-vlc: For video playback functionality
+- VLC media player: Must be installed on the system
+"""
+
 import sys
 import os
 import logging
 import vlc
-import random  # Add random module
+import random
+import subprocess
+import ctypes
+from ctypes.wintypes import MAX_PATH
 from collections import OrderedDict
 
-# Configure logging
+# Configure logging for debugging and error tracking
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                              QListWidget, QListWidgetItem, QLabel, QStackedWidget, 
                              QFrame, QFileDialog)
-from PyQt5.QtCore import Qt, QTimer, QSize, QPoint
+from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, pyqtSignal
 from PyQt5.QtGui import QPalette, QColor
 
 class VideoViewer(QMainWindow):
+    """
+    Main application window class that handles video playback and user interaction.
+    
+    This class creates a frameless window that mimics TikTok's interface for viewing
+    local video files. It handles video playback, window positioning, and user input.
+    
+    Attributes:
+        video_folder (str): Path to the folder containing video files
+        original_files (list): List of video files in their original order
+        video_files (list): Shuffled list of video files for playback
+        current_video_index (int): Index of the currently playing video
+        cache_size (int): Number of videos to keep in memory cache (current + 3 before + 3 after)
+        media_cache (OrderedDict): Cache storing preloaded video media objects
+        _drag_pos (QPoint): Tracks mouse position during window dragging
+        _last_position (QPoint): Stores the last window position
+    """
+    
+    # Add signal for video end event
+    video_ended_signal = pyqtSignal()
+    
     def __init__(self, video_folder):
+        """
+        Initialize the video viewer application.
+        
+        Args:
+            video_folder (str): Path to the folder containing video files
+        """
         super().__init__()
 
-        # Remove window frame and make it frameless
+        # Configure window properties for a frameless, always-on-top display
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         
-        # Enable custom window drag
+        # Initialize window dragging variables
         self._drag_pos = None
+        self._last_position = None
 
         self.video_folder = video_folder
-        self.original_files = []  # Store original order
-        self.video_files = []
+        self.original_files = []  # Preserve original file order
+        self.video_files = []     # Will contain shuffled playlist
         self.current_video_index = 0
 
+        # Set up the main window properties
         self.setWindowTitle("TikTok-like Video Viewer")
-        self.setGeometry(100, 100, 720, 1280) # Set a typical phone-like aspect ratio
+        self.setGeometry(100, 100, 720, 1280)  # Mobile-like aspect ratio
+        self.setMinimumSize(400, 600)          # Prevent window from being too small
+        self.setMaximumSize(1920, 1080)        # Prevent window from being too large
 
-        # Add minimum/maximum sizes
-        self.setMinimumSize(400, 600)
-        self.setMaximumSize(1920, 1080)
-
-        # Set dark theme for title bar and window
+        # Apply dark theme styling
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #000000;
@@ -49,70 +97,97 @@ class VideoViewer(QMainWindow):
             }
         """)
 
+        # Set up the central widget and layout
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-
         self.layout = QVBoxLayout()
         self.central_widget.setLayout(self.layout)
 
-        # Replace stacked widget with single frame for VLC
+        # Create video frame
         self.video_frame = QFrame()
         self.video_frame.setAutoFillBackground(True)
         self.layout.addWidget(self.video_frame)
 
-        # Add timer for handling video end events
+        # Initialize video end detection timer
         self.end_timer = QTimer()
         self.end_timer.setSingleShot(True)
         self.end_timer.timeout.connect(self.handle_video_end)
         
-        # Initialize VLC with minimal options
+        # Initialize VLC instance with optimized settings
         vlc_options = [
-            '--quiet',              # Suppress most messages
-            '--verbose=0',          # Reduce verbosity
-            '--no-plugins-cache',   # Don't use plugins cache
-            '--no-stats',          # Don't log statistics
-            '--no-sub-autodetect-file'  # Don't look for subtitles
+            '--quiet',              # Minimize VLC messages
+            '--verbose=0',          # Reduce logging verbosity
+            '--no-plugins-cache',   # Disable plugins cache
+            '--no-stats',          # Disable statistics logging
+            '--no-sub-autodetect-file',  # Disable subtitle auto-detection
+            '--input-repeat=65535'  # Set repeat count to a high number
         ]
         self.instance = vlc.Instance(vlc_options)
         if not self.instance:
             logger.error("Failed to create VLC instance")
             sys.exit(1)
             
+        # Create and configure media player
         self.media_player = self.instance.media_player_new()
         if not self.media_player:
             logger.error("Failed to create media player")
             sys.exit(1)
 
-        # Configure VLC player options
+        # Attach media player to our video frame
         self.media_player.set_hwnd(self.video_frame.winId())
         
-        # Media options for individual files
+        # Configure VLC media options for optimal playback
         self.vlc_media_options = [
-            'avcodec-hw=none',
-            'avcodec-threads=1',
-            'avcodec-fast',
-            'skip-frames=0',
-            'vout=direct3d11'
+            'avcodec-hw=none',          # Disable hardware acceleration
+            'avcodec-threads=1',        # Single threaded decoding
+            'avcodec-fast',             # Enable fast decoding
+            'skip-frames=0',            # Don't skip frames
+            'vout=direct3d11',          # Use Direct3D11 video output
+            '--loop',                   # Enable looping
+            '--repeat'                  # Enable repeat mode
         ]
 
-        # Set up event manager for end of media detection
+        # Connect video end signal to handler
+        self.video_ended_signal.connect(self.handle_video_end)
+        
+        # Set up VLC event manager for end-of-media detection
         self.event_manager = self.media_player.event_manager()
         self.event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, self.on_media_end)
 
-        # Add video cache
-        self.cache_size = 7  # Current + 3 before + 3 after
+        # Initialize video cache
+        self.cache_size = 7  # Cache window size (current + 3 before + 3 after)
         self.media_cache = OrderedDict()
 
+        # Load videos and start playback
         self.load_videos()
         self.play_current_video()
 
     def load_videos(self):
-        """Scans the specified folder for video files."""
-        if not os.path.isdir(self.video_folder):
-            print(f"Error: Folder not found at {self.video_folder}")
-            return
+        """
+        Scan the video folder for supported video files and create a shuffled playlist.
+        If the folder is invalid or contains no videos, shows a folder selection dialog.
+        """
+        while not os.path.isdir(self.video_folder) or not self.has_video_files(self.video_folder):
+            print(f"No valid videos found in: {self.video_folder}")
+            new_folder = QFileDialog.getExistingDirectory(
+                self,
+                "Select Folder Containing Videos",
+                os.path.expanduser("~"),
+                QFileDialog.ShowDirsOnly
+            )
+            
+            if not new_folder:  # User canceled selection
+                print("No folder selected. Exiting...")
+                sys.exit(0)
+                
+            self.video_folder = new_folder
+            save_folder_to_cache(new_folder)  # Save the new folder choice
 
-        # Supported video extensions (you can add more)
+        # Clear any existing files
+        self.original_files.clear()
+        self.video_files.clear()
+
+        # Supported video extensions
         valid_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.wmv')
 
         for entry in os.listdir(self.video_folder):
@@ -131,9 +206,32 @@ class VideoViewer(QMainWindow):
             no_videos_label.setAlignment(Qt.AlignCenter)
             no_videos_label.setStyleSheet("color: white; font-size: 20px;")
             self.layout.addWidget(no_videos_label)
+            
+    def has_video_files(self, folder):
+        """
+        Check if a folder contains any supported video files.
+        
+        Args:
+            folder (str): Path to check for video files
+            
+        Returns:
+            bool: True if folder contains supported video files, False otherwise
+        """
+        valid_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.wmv')
+        for entry in os.listdir(folder):
+            if entry.lower().endswith(valid_extensions):
+                return True
+        return False
 
     def preload_videos(self):
-        """Preloads videos within the sliding window."""
+        """
+        Manage the video preload cache within a sliding window around the current video.
+        
+        Maintains a cache of parsed media objects for smooth playback:
+        - Removes videos that fall outside the cache window
+        - Loads upcoming videos within the window
+        - Window size is determined by self.cache_size
+        """
         if not self.video_files:
             return
 
@@ -157,7 +255,21 @@ class VideoViewer(QMainWindow):
                 self.media_cache[idx] = media
 
     def adjust_window_size(self, media):
-        """Adjusts window size based on video dimensions."""
+        """
+        Adjust the window size to match video dimensions while maintaining aspect ratio.
+        
+        Args:
+            media (vlc.Media): VLC media object containing video metadata
+            
+        The window size is calculated to:
+        - Maintain aspect ratio
+        - Not exceed 90% of screen height
+        - Include padding for controls
+        - Preserve window position after first placement
+        """
+        # Store current position before resizing
+        current_pos = self.pos()
+        
         # Wait a bit for media to be parsed
         media.parse()
         
@@ -183,27 +295,43 @@ class VideoViewer(QMainWindow):
         padding = 40
         new_width = min(target_width + padding, screen.width())
         new_height = min(target_height + padding, screen.height())
-        self.resize(new_width, new_height)
         
-        # Center window
-        self.center_window()
+        # If this is the first video, center the window
+        if self._last_position is None:
+            self.resize(new_width, new_height)
+            self.center_window()
+            self._last_position = self.pos()
+        else:
+            # Otherwise maintain the current position
+            self.resize(new_width, new_height)
+            self.move(current_pos)
         
     def center_window(self):
-        """Centers the window on the screen."""
+        """
+        Center the window on the primary screen.
+        
+        This is only called once when the application first starts.
+        Subsequent video loads will maintain the window's position.
+        """
         frame_geo = self.frameGeometry()
         screen_center = QApplication.primaryScreen().geometry().center()
         frame_geo.moveCenter(screen_center)
         self.move(frame_geo.topLeft())
 
     def play_current_video(self):
-        """Loads and plays the video at the current index."""
+        """
+        Load and play the video at the current index.
+        """
         if 0 <= self.current_video_index < len(self.video_files):
             # Ensure current video is in cache
             if self.current_video_index not in self.media_cache:
                 video_path = self.video_files[self.current_video_index]
                 media = self.instance.media_new(video_path)
-                for option in self.vlc_media_options:
-                    media.add_option(option)
+                
+                # Set media options for looping
+                media.add_option(':input-repeat=65535')  # Set a high repeat count
+                media.add_option(':repeat=65535')        # Enable repeat mode
+                
                 media.parse()
                 self.media_cache[self.current_video_index] = media
 
@@ -214,58 +342,137 @@ class VideoViewer(QMainWindow):
                 return
 
             self.media_player.set_media(media)
+            
+            # Set looping at the player level as well
+            self.media_player.set_media(media)
             self.media_player.play()
+            
+            # Create a timer to check video position periodically
+            self.position_timer = QTimer()
+            self.position_timer.setInterval(500)  # Check every 500ms
+            self.position_timer.timeout.connect(self.check_video_position)
+            self.position_timer.start()
             
             # Wait a short moment for video to start before adjusting size
             QTimer.singleShot(100, lambda: self.adjust_window_size(media))
             
-            logger.info(f"Attempting to play: {self.video_files[self.current_video_index]}")
+            logger.info(f"Playing (looped): {self.video_files[self.current_video_index]}")
             
             # Preload adjacent videos
             self.preload_videos()
 
-    def toggle_play_pause(self):
-        """Toggles play/pause state of the current video."""
-        if self.media_player.is_playing():
-            self.media_player.pause()
-        else:
+    def check_video_position(self):
+        """Check if video has ended and restart if necessary."""
+        if self.media_player.get_state() == vlc.State.Ended:
+            self.media_player.set_position(0)
+            self.media_player.play()
+        elif self.media_player.get_position() >= 0.99:  # If near the end (99%)
+            self.media_player.set_position(0)
             self.media_player.play()
 
     def scroll_down(self):
-        """Scrolls to the next video."""
+        """
+        Navigate to the next video in the playlist.
+        
+        - Stops current video
+        - Increments video index
+        - Starts playback of next video
+        """
         if self.current_video_index < len(self.video_files) - 1:
+            # Stop the position timer if it exists
+            if hasattr(self, 'position_timer'):
+                self.position_timer.stop()
             self.media_player.stop()
             self.current_video_index += 1
             self.play_current_video()
 
     def scroll_up(self):
-        """Scrolls to the previous video."""
+        """
+        Navigate to the previous video in the playlist.
+        
+        - Stops current video
+        - Decrements video index
+        - Starts playback of previous video
+        """
         if self.current_video_index > 0:
+            # Stop the position timer if it exists
+            if hasattr(self, 'position_timer'):
+                self.position_timer.stop()
             self.media_player.stop()
             self.current_video_index -= 1
             self.play_current_video()
 
+    def toggle_play_pause(self):
+        """
+        Toggle between play and pause states for the current video.
+        Uses VLC's is_playing() to determine current state and toggle appropriately.
+        """
+        if self.media_player.is_playing():
+            self.media_player.pause()
+        else:
+            self.media_player.play()
+
+    def show_in_explorer(self):
+        """
+        Show the current video file in Windows File Explorer.
+        Uses a simple command that reliably highlights the file.
+        """
+        if 0 <= self.current_video_index < len(self.video_files):
+            # Get the absolute path and convert any forward slashes to backslashes
+            video_path = os.path.abspath(self.video_files[self.current_video_index]).replace('/', '\\')
+            if os.path.exists(video_path):
+                # Use string literal with Windows-style path
+                cmd = rf'explorer /select,"{video_path}"'
+                os.system(cmd)
+
     def mousePressEvent(self, event):
-        """Handle mouse press for window dragging."""
+        """
+        Handle mouse press events for window dragging.
+        
+        Args:
+            event (QMouseEvent): Mouse event containing position information
+        """
         if event.button() == Qt.LeftButton:
             self._drag_pos = event.globalPos() - self.pos()
             event.accept()
 
     def mouseMoveEvent(self, event):
-        """Handle window dragging."""
+        """
+        Handle window dragging when mouse is moved.
+        
+        Args:
+            event (QMouseEvent): Mouse event containing position information
+        """
         if self._drag_pos is not None:
             self.move(event.globalPos() - self._drag_pos)
             event.accept()
 
     def mouseReleaseEvent(self, event):
-        """Handle mouse release for window dragging."""
+        """
+        Handle mouse release to end window dragging.
+        
+        Args:
+            event (QMouseEvent): Mouse event containing button information
+        """
         if event.button() == Qt.LeftButton:
             self._drag_pos = None
             event.accept()
 
     def keyPressEvent(self, event):
-        """Handles key press events for scrolling."""
-        if event.key() == Qt.Key_Escape:  # Add escape key to close
+        """
+        Handle keyboard input for navigation and control.
+        
+        Supported keys:
+        - Escape: Close application
+        - Down Arrow: Next video
+        - Up Arrow: Previous video
+        - Space: Toggle play/pause
+        - Enter: Show current video in File Explorer
+        
+        Args:
+            event (QKeyEvent): Keyboard event containing key information
+        """
+        if event.key() == Qt.Key_Escape:
             self.close()
         elif event.key() == Qt.Key_Down:
             self.scroll_down()
@@ -273,30 +480,60 @@ class VideoViewer(QMainWindow):
             self.scroll_up()
         elif event.key() == Qt.Key_Space:
             self.toggle_play_pause()
+        elif event.key() == Qt.Key_Return:  # Handle Enter key
+            self.show_in_explorer()
         else:
             super().keyPressEvent(event)
 
     def wheelEvent(self, event):
-        """Handles mouse wheel events for scrolling."""
+        """
+        Handle mouse wheel events for video navigation.
+        
+        Scroll down -> Next video
+        Scroll up -> Previous video
+        
+        Args:
+            event (QWheelEvent): Mouse wheel event containing scroll information
+        """
         if event.angleDelta().y() < 0: # Scroll down
             self.scroll_down()
         elif event.angleDelta().y() > 0: # Scroll up
             self.scroll_up()
 
     def on_media_end(self, event):
-        """Handler for when a video finishes playing - called from VLC thread."""
-        self.end_timer.start(50)  # Schedule the actual handling in the main thread
+        """
+        Handle video end event from VLC thread.
+        Emits a signal to handle the event in the Qt main thread.
+        
+        Args:
+            event (vlc.Event): VLC event object
+        """
+        # Emit signal to handle in main thread
+        self.video_ended_signal.emit()
 
     def handle_video_end(self):
-        """Handles video end in the main thread."""
-        if self.current_video_index < len(self.video_files) - 1:
-            self.scroll_down()
-        else:
-            self.current_video_index = 0
-            self.play_current_video()
+        """
+        Handle video end in the main thread by restarting the same video.
+        This method is connected to video_ended_signal and runs in the Qt main thread.
+        """
+        # Set position to beginning and restart
+        self.media_player.set_position(0)
+        self.media_player.play()
 
     def closeEvent(self, event):
-        """Clean up VLC resources when closing."""
+        """
+        Clean up resources when application closes.
+        
+        - Stops playback
+        - Releases all cached media
+        - Releases VLC instance
+        
+        Args:
+            event (QCloseEvent): Close event object
+        """
+        # Stop the position timer if it exists
+        if hasattr(self, 'position_timer'):
+            self.position_timer.stop()
         self.media_player.stop()
         # Clear the cache
         for media in self.media_cache.values():
@@ -308,11 +545,24 @@ class VideoViewer(QMainWindow):
 
 
 def get_cache_file_path():
-    """Returns the path to the cache file."""
-    return os.path.join(os.path.dirname(__file__), 'last_folder.txt')
+    """
+    Get the path to the file storing the last used folder.
+    File will be stored in the same directory as the script for easy access.
+    
+    Returns:
+        str: Absolute path to the cache file
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_folder.txt')
 
 def save_folder_to_cache(folder_path):
-    """Saves the folder path to cache file."""
+    """
+    Save the current folder path to cache file.
+    
+    Args:
+        folder_path (str): Path to save
+        
+    Logs any errors that occur during saving.
+    """
     try:
         with open(get_cache_file_path(), 'w') as f:
             f.write(folder_path)
@@ -320,7 +570,14 @@ def save_folder_to_cache(folder_path):
         logger.error(f"Failed to save cache: {e}")
 
 def get_cached_folder():
-    """Returns the cached folder path if it exists and is valid."""
+    """
+    Retrieve the last used folder path from cache.
+    
+    Returns:
+        str: Path from cache if valid, or user's home directory as fallback
+        
+    The path is validated to ensure it still exists before being returned.
+    """
     try:
         cache_file = get_cache_file_path()
         if os.path.exists(cache_file):
@@ -334,12 +591,13 @@ def get_cached_folder():
 
 
 if __name__ == '__main__':
+    # Initialize Qt application
     app = QApplication(sys.argv)
 
-    # Try to get and use cached folder
+    # Get video folder path - either from cache or user selection
     video_folder_path = get_cached_folder()
     
-    # If no valid cached folder, show dialog
+    # If no valid cached folder exists, prompt user for folder selection
     if not os.path.isdir(video_folder_path):
         video_folder_path = QFileDialog.getExistingDirectory(
             None,
@@ -348,14 +606,20 @@ if __name__ == '__main__':
             QFileDialog.ShowDirsOnly
         )
         
-        if not video_folder_path:  # User cancelled the dialog
+        # Exit if user cancels folder selection
+        if not video_folder_path:
             print("No folder selected. Exiting...")
             sys.exit(0)
 
-        # Save the new selection to cache
+        # Save selected folder to cache for next time
         save_folder_to_cache(video_folder_path)
     
+    # Log selected folder path
     logger.info(f"Using video folder: {video_folder_path}")
+    
+    # Create and show main application window
     viewer = VideoViewer(video_folder_path)
     viewer.show()
+    
+    # Start Qt event loop
     sys.exit(app.exec_())
